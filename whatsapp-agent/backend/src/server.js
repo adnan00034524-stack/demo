@@ -1,5 +1,13 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
+// Global error handlers — prevents crashes from unhandled rejections (e.g. puppeteer TargetClosed)
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason instanceof Error ? reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err.message);
+});
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -50,7 +58,10 @@ io.on('connection', (socket) => {
   socket.on('connect-whatsapp', () => {
     console.log('Connect WhatsApp requested by frontend');
     whatsapp.destroy();
-    setTimeout(() => whatsapp.initClient(), 1000);
+    setTimeout(() => {
+      // initClient already handles killOrphanBrowsers + clearProfileLocks
+      whatsapp.initClient();
+    }, 2000);
   });
   socket.on('disconnect', () => {
     console.log('Frontend disconnected:', socket.id);

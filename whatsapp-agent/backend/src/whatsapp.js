@@ -19,6 +19,7 @@ let lastEmittedState = null;
 let watchdogInterval = null;
 let io = null;
 let onMessageCallback = null;
+let _initializing = false; // guard against concurrent initClient()
 
 function setState(state, extra = {}) {
   currentState = state;
@@ -33,11 +34,11 @@ function startWatchdog() {
   if (watchdogInterval) clearInterval(watchdogInterval);
   let failCount = 0;
 
-  watchdogInterval = setInterval(() => {
+  watchdogInterval = setInterval(async () => {
     if (!client) return;
 
     try {
-      const state = client.getState();
+      const state = await client.getState();
       if (state === 'CONNECTED') {
         failCount = 0;
       } else {
@@ -75,10 +76,20 @@ async function handleQR(qr) {
 let initRetryTimeout = null;
 
 function initClient() {
+  if (_initializing) {
+    console.log('initClient: already initializing, skipping');
+    return;
+  }
+  _initializing = true;
+
   setState(STATE.STARTING);
 
-  killOrphanBrowsers();
-  clearProfileLocks();
+  try {
+    killOrphanBrowsers();
+    clearProfileLocks();
+  } catch (err) {
+    console.warn('initClient: cleanup error:', err.message);
+  }
 
   setState(STATE.CONNECTING);
 
@@ -116,6 +127,7 @@ function initClient() {
     console.log('WhatsApp ready');
     setState(STATE.CONNECTED);
     startWatchdog();
+    _initializing = false;
   });
 
   client.on('change_state', (state) => {
@@ -156,17 +168,20 @@ function initClient() {
   }).catch(err => {
     clearTimeout(initTimeout);
     console.error('Client init error:', err.message);
-    console.error('Full error:', err);
     setState(STATE.ERROR, { error: err.message });
-    // Retry after 3 seconds
+    // Don't retry immediately on TargetClosedError (Chrome was killed)
+    const isTargetClosed = err.message?.includes('Target closed') || err.name?.includes('TargetCloseError');
+    const retryDelay = isTargetClosed ? 5000 : 3000;
     if (initRetryTimeout) clearTimeout(initRetryTimeout);
     initRetryTimeout = setTimeout(() => {
+      _initializing = false;
       if (getState() !== STATE.CONNECTED) {
         console.log('Retrying init...');
-        destroy();
         initClient();
       }
-    }, 3000);
+    }, retryDelay);
+  }).finally(() => {
+    _initializing = false;
   });
 }
 

@@ -4,6 +4,8 @@ const path = require('path');
 const fs = require('fs');
 const Tesseract = require('tesseract.js');
 const { transcribeLocal } = require('./transcribeLocal');
+const { runPipeline } = require('./agents/pipeline');
+const { preprocessImage } = require('./imagePreprocessor');
 
 async function handleIncomingMessage(msg) {
   const startTime = Date.now();
@@ -57,11 +59,50 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
   const uploadsDir = path.join(__dirname, '..', 'uploads');
   if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
-  const ext = media.mimetype?.split('/')[1] || 'bin';
-  const filename = `whatsapp_${Date.now()}_${chatId.replace(/[^a-zA-Z0-9]/g, '_')}.${ext}`;
-  const filePath = path.join(uploadsDir, filename);
+  // Derive correct file extension
+  const MIME_EXT_MAP = {
+    'application/pdf': 'pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.ms-excel': 'xls',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/bmp': 'bmp',
+    'image/tiff': 'tiff',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/webm': 'webm',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'text/plain': 'txt',
+    'text/csv': 'csv',
+    'application/json': 'json',
+    'application/rtf': 'rtf',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'application/vnd.ms-powerpoint': 'ppt',
+  };
+  // Clean mime: remove parameters like "; codecs=opus"
+  const cleanMime = (media.mimetype || '').split(';')[0].trim().toLowerCase();
+  let originalName = media.filename || `whatsapp_${Date.now()}_${chatId.replace(/[^a-zA-Z0-9]/g, '_')}`;
+  let ext = MIME_EXT_MAP[cleanMime];
+  if (!ext) {
+    // Fallback: try the subtype after '/'
+    const subtype = cleanMime.split('/')[1];
+    ext = subtype || 'bin';
+  }
+  // For documents with a real filename, preserve original extension
+  if (msg.type === 'document' && media.filename) {
+    const origExt = path.extname(media.filename).toLowerCase().replace(/^\./, '');
+    if (origExt) ext = origExt;
+  }
+  const filenameSafe = `${Date.now()}_${chatId.replace(/[^a-zA-Z0-9]/g, '_')}.${ext}`;
+  const filePath = path.join(uploadsDir, filenameSafe);
   fs.writeFileSync(filePath, media.data, 'base64');
-  console.log(`[MEDIA] Saved: ${filename} (${media.mimetype})`);
+  console.log(`[MEDIA] Saved: ${filenameSafe} (${media.mimetype}) origName=${originalName}`);
 
   let extractedText = '';
   let mediaLabel = '';
@@ -70,21 +111,49 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
   if (msg.type === 'ptt' || msg.type === 'audio') {
     mediaLabel = '[Voice]';
     extractedText = await transcribeAudio(filePath, media.mimetype, settings);
-    if (extractedText) console.log(`[STT] "${extractedText}"`);
+    if (extractedText) {
+      console.log(`[STT] "${extractedText}"`);
+      const result = await runPipeline(extractedText, 'audio');
+      extractedText = result.cleanedText || extractedText;
+      if (result.validation) console.log(`[STT] Validation: confidence=${result.validation.confidence}`);
+    }
   }
 
   // Image → OCR
   else if (msg.type === 'image') {
     mediaLabel = '[Image]';
     extractedText = await ocrImage(filePath);
-    if (extractedText) console.log(`[OCR] "${extractedText}"`);
-    else console.log('[OCR] No text extracted');
+    if (extractedText) {
+      console.log(`[OCR] "${extractedText}"`);
+      const result = await runPipeline(extractedText, 'image');
+      extractedText = result.cleanedText || extractedText;
+      if (result.validation) console.log(`[OCR] Validation: confidence=${result.validation.confidence}`);
+    } else {
+      console.log('[OCR] No text extracted');
+    }
   }
 
-  // Document / PDF → extract text
-  else if (msg.type === 'document' || media.mimetype === 'application/pdf') {
+  // Video → skip (no transcription yet)
+  else if (msg.type === 'video') {
+    mediaLabel = '[Video]';
+  }
+
+  // Document / PDF / Office files → extract text
+  else if (msg.type === 'document' || cleanMime === 'application/pdf') {
     mediaLabel = '[Document]';
-    extractedText = await extractPdfText(filePath);
+
+    // Use DocumentManager for unified extraction (handles PDF, DOCX, XLSX, images, etc.)
+    if (global.documentManager) {
+      extractedText = await global.documentManager.extractText(filePath);
+    } else {
+      // Fallback to pdf-specific extraction if documentManager not available
+      extractedText = await extractPdfText(filePath);
+      if (extractedText) {
+        const result = await runPipeline(extractedText, '.pdf');
+        extractedText = result.cleanedText || extractedText;
+        if (result.validation) console.log(`[PDF] Validation: confidence=${result.validation.confidence}`);
+      }
+    }
 
     // Index for RAG synchronously so AI gets the context
     if (extractedText && settings.ragEnabled && global.documentManager) {
@@ -92,11 +161,11 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
         const { v4: uuid } = require('uuid');
         const docId = uuid();
         db.addDocument({
-          id: docId, filename, originalName: filename,
+          id: docId, filename: filenameSafe, originalName,
           status: 'indexing', chunkCount: 0,
           createdAt: new Date().toISOString(),
         });
-        const chunkCount = await global.documentManager.processDocument(docId, filePath, filename);
+        const chunkCount = await global.documentManager.processDocument(docId, filePath, originalName, extractedText);
         db.updateDocument(docId, { status: 'ready', chunkCount });
         console.log(`[MEDIA] Document indexed: ${docId} (${chunkCount} chunks)`);
       } catch (err) {
@@ -104,8 +173,8 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
       }
     }
 
-    if (extractedText) console.log(`[PDF] Extracted ${extractedText.length} chars`);
-    else console.log('[PDF] No text extracted');
+    if (extractedText) console.log(`[DOC] Extracted ${extractedText.length} chars`);
+    else console.log('[DOC] No text extracted');
   }
 
   // Unknown media type
@@ -121,7 +190,7 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
 
   // If we got text, generate AI reply
   if (extractedText) {
-    const isDocument = msg.type === 'document' || media.mimetype === 'application/pdf';
+    const isDocument = msg.type === 'document' || cleanMime === 'application/pdf';
     const reply = await generateAIReply(extractedText, settings, chatId, senderName, isDocument);
     if (reply) {
       await sendReply(chatId, reply, settings);
@@ -157,8 +226,12 @@ async function transcribeAudio(filePath, mimetype, settings) {
 }
 
 async function ocrImage(filePath) {
+  // Preprocess image for better OCR accuracy (grayscale + contrast)
+  const processedBuffer = await preprocessImage(filePath);
+  const source = processedBuffer || filePath;
+
   try {
-    const { data } = await Tesseract.recognize(filePath, 'eng+urd', {
+    const { data } = await Tesseract.recognize(source, 'eng+urd', {
       logger: (m) => {
         if (m.status === 'recognizing text') {
           console.log(`[OCR] Progress: ${Math.round(m.progress * 100)}%`);
@@ -167,12 +240,12 @@ async function ocrImage(filePath) {
     });
     if (data.text.trim()) return data.text.trim();
     console.log('[OCR] eng+urd gave empty result, trying eng only');
-    const { data: engData } = await Tesseract.recognize(filePath, 'eng');
+    const { data: engData } = await Tesseract.recognize(source, 'eng');
     return engData.text.trim();
   } catch (err) {
     console.error('[OCR] eng+urd failed:', err.message);
     try {
-      const { data: engData } = await Tesseract.recognize(filePath, 'eng');
+      const { data: engData } = await Tesseract.recognize(source, 'eng');
       return engData.text.trim();
     } catch (err2) {
       console.error('[OCR] eng fallback also failed:', err2.message);
@@ -275,6 +348,21 @@ Examples:
 - User writes mix → reply in the primary language used
 Do NOT switch languages. Do NOT explain this rule.`);
 
+  if (isDocument) {
+    systemParts.push(`\n## Document Analysis Instructions
+You are analyzing text extracted via OCR from a user-uploaded document.
+
+FILE TYPE HANDLING:
+- If the document appears to be tabular/grid data (rows, columns, numbers, financial figures): reconstruct the table structure to find counts, sums, balances, or specific row data accurately.
+- If the document appears to be continuous text (paragraphs, clauses, headings): treat it as a formal document and look for contextual answers, specific clauses, or relevant sections.
+
+RULES:
+- Text may be in English, Urdu, or a mix. Respond in the same language the user uses.
+- If OCR text is messy or has spelling mistakes, use semantic context to infer the original word. Do NOT complain about OCR quality.
+- Keep response short, clear, formatted for WhatsApp (bold for headings, bullet points for lists, under 200 words).
+- If the answer cannot be found in the provided text, politely state: "Maazrat, is document me is sawal ka jawab nahi mil saka."`);
+  }
+
   const systemContent = systemParts.join('\n\n');
 
   // --- Conversation history (last 10 messages) ---
@@ -292,7 +380,7 @@ Do NOT switch languages. Do NOT explain this rule.`);
   // --- Build final messages array ---
   let userMessage;
   if (isDocument) {
-    userMessage = `${senderName} sent a document. Here is the extracted text content:\n\n---\n${messageText}\n---\n\nPlease acknowledge the document and ask if they have any questions about its contents, or provide a brief summary.`;
+    userMessage = `[FILE_TYPE]: Detected from the document content\n[OCR_TEXT]:\n${messageText}\n[USER_QUERY]: ${senderName} is asking about this document. Please analyze and respond.`;
   } else {
     userMessage = `${senderName}: "${messageText}"`;
   }

@@ -9,3 +9,4 @@ chromadb/
 *.db-shm
 *.db-wal
 *.traineddata
+chrome/
