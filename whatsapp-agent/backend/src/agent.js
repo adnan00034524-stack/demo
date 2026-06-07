@@ -182,20 +182,24 @@ async function handleMediaMessage(msg, chatId, senderName, settings) {
     mediaLabel = `[${msg.type || 'Media'}]`;
   }
 
-  const userText = extractedText
-    ? `${mediaLabel} "${extractedText}"`
+  // User's caption/query (the text sent alongside the media)
+  const userQuery = (msg.body || '').trim();
+
+  // Store in DB: use a short preview, not the full extracted text
+  const textForDb = extractedText
+    ? `${mediaLabel} "${extractedText.substring(0, 200)}${extractedText.length > 200 ? '...' : ''}"`
     : `${mediaLabel} (no text extracted)`;
 
-  db.addMessage(chatId, { from: 'user', text: userText, timestamp: new Date() });
+  db.addMessage(chatId, { from: 'user', text: textForDb, timestamp: new Date() });
 
   // If we got text, generate AI reply
   if (extractedText) {
     const isDocument = msg.type === 'document' || cleanMime === 'application/pdf';
-    const reply = await generateAIReply(extractedText, settings, chatId, senderName, isDocument);
+    const reply = await generateAIReply(extractedText, settings, chatId, senderName, isDocument, userQuery);
     if (reply) {
       await sendReply(chatId, reply, settings);
       db.addMessage(chatId, { from: 'agent', text: reply, timestamp: new Date() });
-      emitEvents(chatId, senderName, userText, reply);
+      emitEvents(chatId, senderName, textForDb, reply);
       return;
     }
   }
@@ -306,7 +310,9 @@ async function extractPdfText(filePath) {
   }
 }
 
-async function generateAIReply(messageText, settings, chatId, senderName, isDocument = false) {
+const MAX_DOC_TEXT_LENGTH = 4000; // characters — prevents token overflow
+
+async function generateAIReply(messageText, settings, chatId, senderName, isDocument = false, userQuery = '') {
   const faqs = db.getFaqs();
 
   // --- System prompt (single string) ---
@@ -365,13 +371,16 @@ RULES:
 
   const systemContent = systemParts.join('\n\n');
 
-  // --- Conversation history (last 10 messages) ---
+  // --- Conversation history (last 2 pairs, preview only) ---
   const chat = db.getChat(chatId);
-  const history = (chat?.messages || []).slice(-20); // last 20 stored entries = ~10 pairs
+  const history = (chat?.messages || []).slice(-8); // last 8 entries = ~4 pairs
   const historyMessages = [];
   for (const m of history) {
+    const content = m.from === 'user' && isDocument
+      ? m.text.substring(0, 100) + '... [document preview in history]'
+      : m.text;
     if (m.from === 'user') {
-      historyMessages.push({ role: 'user', content: m.text });
+      historyMessages.push({ role: 'user', content });
     } else if (m.from === 'agent') {
       historyMessages.push({ role: 'assistant', content: m.text });
     }
@@ -380,7 +389,12 @@ RULES:
   // --- Build final messages array ---
   let userMessage;
   if (isDocument) {
-    userMessage = `[FILE_TYPE]: Detected from the document content\n[OCR_TEXT]:\n${messageText}\n[USER_QUERY]: ${senderName} is asking about this document. Please analyze and respond.`;
+    // Truncate long document text to prevent token overflow
+    const docText = messageText.length > MAX_DOC_TEXT_LENGTH
+      ? messageText.substring(0, MAX_DOC_TEXT_LENGTH) + `\n\n...[truncated, ${messageText.length - MAX_DOC_TEXT_LENGTH} more chars]`
+      : messageText;
+    const query = userQuery || `${senderName} is asking about this document. Please analyze and respond.`;
+    userMessage = `[FILE_TYPE]: Detected from the document content\n[OCR_TEXT]:\n${docText}\n[USER_QUERY]: ${query}`;
   } else {
     userMessage = `${senderName}: "${messageText}"`;
   }
@@ -391,7 +405,7 @@ RULES:
     { role: 'user', content: userMessage },
   ];
 
-  console.log(`[AI] Calling provider: ${settings.aiProvider} (${messages.length} messages)`);
+  console.log(`[AI] Calling provider: ${settings.aiProvider} (${messages.length} msgs, userMsg=${messageText.length} chars)`);
 
   let reply;
   try {
@@ -399,7 +413,14 @@ RULES:
     console.log(`[AI] Reply generated (${reply.length} chars)`);
   } catch (err) {
     console.error(`[AI] Provider failed:`, err.message);
-    reply = getFaqFallback(messageText, faqs);
+    if (isDocument && messageText) {
+      const reason = userQuery
+        ? `Main ne document parh liya hai. ${userQuery}`
+        : `Main ne document parh liya hai. Aap is document ke baare mein kya jaanna chahte hain?`;
+      reply = reason;
+    } else {
+      reply = getFaqFallback(messageText, faqs);
+    }
   }
 
   return reply;
